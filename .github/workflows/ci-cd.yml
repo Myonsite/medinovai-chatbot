@@ -1,0 +1,380 @@
+name: MedinovAI Chatbot CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop, chatbot ]
+  pull_request:
+    branches: [ main ]
+  release:
+    types: [ published ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: myonsite-healthcare/medinovai-chatbot
+
+jobs:
+  # =============================================================================
+  # SECURITY SCANNING & LINTING
+  # =============================================================================
+  security-scan:
+    name: Security & Code Quality
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install bandit safety black flake8 mypy
+        pip install -r src/requirements.txt
+    
+    - name: Run Black (Code Formatting)
+      run: black --check --diff src/
+    
+    - name: Run Flake8 (Linting)
+      run: flake8 src/ --max-line-length=88 --extend-ignore=E203,W503
+    
+    - name: Run MyPy (Type Checking)
+      run: mypy src/ --ignore-missing-imports
+    
+    - name: Run Bandit (Security)
+      run: bandit -r src/ -f json -o bandit-report.json || true
+    
+    - name: Run Safety (Dependency Check)
+      run: safety check --json --output safety-report.json || true
+    
+    - name: Upload Security Reports
+      uses: actions/upload-artifact@v3
+      with:
+        name: security-reports
+        path: |
+          bandit-report.json
+          safety-report.json
+
+  # =============================================================================
+  # TESTING
+  # =============================================================================
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    needs: security-scan
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_USER: test_user
+          POSTGRES_DB: test_medinovai
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+      
+      chroma:
+        image: chromadb/chroma:latest
+        ports:
+          - 8000:8000
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r src/requirements.txt
+        pip install pytest pytest-cov pytest-asyncio
+    
+    - name: Set up test environment
+      run: |
+        cp .env.example .env
+        echo "DATABASE_URL=postgresql://test_user:test_password@localhost:5432/test_medinovai" >> .env
+        echo "REDIS_URL=redis://localhost:6379/0" >> .env
+        echo "VECTOR_DB_URL=http://localhost:8000" >> .env
+        echo "OPENAI_API_KEY=test-key" >> .env
+        echo "JWT_SECRET=test-secret-key-for-testing" >> .env
+        echo "DEVELOPMENT_MODE=true" >> .env
+    
+    - name: Run unit tests
+      run: |
+        cd src
+        pytest tests/unit/ -v --cov=. --cov-report=xml --cov-report=html
+    
+    - name: Run integration tests
+      run: |
+        cd src
+        pytest tests/integration/ -v
+    
+    - name: Upload coverage reports
+      uses: codecov/codecov-action@v3
+      with:
+        file: src/coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+
+  # =============================================================================
+  # BUILD DOCKER IMAGES
+  # =============================================================================
+  build:
+    name: Build Docker Images
+    runs-on: ubuntu-latest
+    needs: [security-scan, test]
+    if: github.event_name != 'pull_request'
+    
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-tag: ${{ steps.meta.outputs.tags }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+    
+    - name: Build and push Docker image
+      id: build
+      uses: docker/build-push-action@v5
+      with:
+        context: ./src
+        file: ./src/Dockerfile
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        platforms: linux/amd64,linux/arm64
+
+  # =============================================================================
+  # DEPLOY TO STAGING
+  # =============================================================================
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/develop'
+    environment: staging
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+    
+    - name: Install kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+    
+    - name: Update kubeconfig
+      run: |
+        aws eks update-kubeconfig --region us-east-1 --name medinovai-staging
+    
+    - name: Deploy to staging
+      run: |
+        kubectl set image deployment/medinovai-chatbot-api \
+          medinovai-chatbot-api=${{ needs.build.outputs.image-tag }} \
+          -n medinovai-staging
+        kubectl rollout status deployment/medinovai-chatbot-api -n medinovai-staging
+
+  # =============================================================================
+  # DEPLOY TO PRODUCTION
+  # =============================================================================
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+    
+    - name: Install kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+    
+    - name: Update kubeconfig
+      run: |
+        aws eks update-kubeconfig --region us-east-1 --name medinovai-production
+    
+    - name: Deploy to production
+      run: |
+        kubectl set image deployment/medinovai-chatbot-api \
+          medinovai-chatbot-api=${{ needs.build.outputs.image-tag }} \
+          -n medinovai-production
+        kubectl rollout status deployment/medinovai-chatbot-api -n medinovai-production
+    
+    - name: Run smoke tests
+      run: |
+        # Wait for deployment to be ready
+        sleep 30
+        
+        # Get service URL
+        PROD_URL=$(kubectl get service medinovai-chatbot-api-service \
+          -n medinovai-production \
+          -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+        
+        # Run basic health check
+        curl -f "https://${PROD_URL}/api/health/live" || exit 1
+        curl -f "https://${PROD_URL}/api/health/ready" || exit 1
+
+  # =============================================================================
+  # INFRASTRUCTURE DEPLOYMENT
+  # =============================================================================
+  deploy-infrastructure:
+    name: Deploy Infrastructure
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && contains(github.event.head_commit.message, '[infra]')
+    environment: production
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+    
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.5.0
+    
+    - name: Terraform Init
+      run: |
+        cd infra/
+        terraform init
+    
+    - name: Terraform Plan
+      run: |
+        cd infra/
+        terraform plan -var-file="environments/prod.tfvars" -out=tfplan
+    
+    - name: Terraform Apply
+      run: |
+        cd infra/
+        terraform apply -auto-approve tfplan
+
+  # =============================================================================
+  # NOTIFICATION
+  # =============================================================================
+  notify:
+    name: Send Notifications
+    runs-on: ubuntu-latest
+    needs: [deploy-production, deploy-staging]
+    if: always()
+    
+    steps:
+    - name: Notify Slack on Success
+      if: ${{ needs.deploy-production.result == 'success' || needs.deploy-staging.result == 'success' }}
+      uses: 8398a7/action-slack@v3
+      with:
+        status: success
+        channel: '#deployments'
+        text: |
+          🚀 MedinovAI Chatbot deployed successfully!
+          Branch: ${{ github.ref }}
+          Commit: ${{ github.sha }}
+          Environment: ${{ github.ref == 'refs/heads/main' && 'Production' || 'Staging' }}
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+    
+    - name: Notify Slack on Failure
+      if: ${{ needs.deploy-production.result == 'failure' || needs.deploy-staging.result == 'failure' }}
+      uses: 8398a7/action-slack@v3
+      with:
+        status: failure
+        channel: '#deployments'
+        text: |
+          ❌ MedinovAI Chatbot deployment failed!
+          Branch: ${{ github.ref }}
+          Commit: ${{ github.sha }}
+          Environment: ${{ github.ref == 'refs/heads/main' && 'Production' || 'Staging' }}
+          Please check the logs and fix the issues.
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # =============================================================================
+  # CLEANUP
+  # =============================================================================
+  cleanup:
+    name: Cleanup Old Images
+    runs-on: ubuntu-latest
+    needs: [deploy-production]
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Delete old container images
+      uses: actions/delete-package-versions@v4
+      with:
+        package-name: medinovai-chatbot
+        package-type: container
+        min-versions-to-keep: 5
+        delete-only-untagged-versions: true 
