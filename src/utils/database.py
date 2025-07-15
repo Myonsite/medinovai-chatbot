@@ -1,320 +1,465 @@
 """
-Database Configuration and Management for MedinovAI Chatbot
-HIPAA-compliant database operations with encryption and audit logging
+Database Models and Operations for MedinovAI
+HIPAA-compliant database schema with audit logging and encryption
 """
 
+import asyncio
 from datetime import datetime
-from typing import AsyncGenerator, Optional, Any, Dict
+from typing import List, Optional, Any, Dict
 
-from sqlalchemy import create_engine, event
-from sqlalchemy.ext.asyncio import (
-    AsyncSession, 
-    create_async_engine, 
-    async_sessionmaker
+import structlog
+from sqlalchemy import (
+    Column, String, Integer, DateTime, Boolean, Text, JSON, 
+    ForeignKey, Enum as SQLEnum, Index, BigInteger, Float
 )
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import relationship, sessionmaker
+from sqlalchemy.dialects.postgresql import UUID
+import uuid
 
 from utils.config import get_settings
-from utils.logging_config import log_database_operation, log_security_event
 
-# Base model for all tables
+logger = structlog.get_logger(__name__)
+
 Base = declarative_base()
 
-# Global database variables
+
+class User(Base):
+    """User model for patients and staff."""
+    __tablename__ = "users"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    phone_number = Column(String(20), unique=True, index=True)
+    email = Column(String(255), unique=True, index=True, nullable=True)
+    encrypted_name = Column(Text, nullable=True)  # Encrypted PHI
+    
+    # Demographics (anonymized)
+    age_group = Column(String(20), nullable=True)  # e.g., "18-25"
+    preferred_language = Column(String(10), default="en")
+    
+    # Authentication
+    phone_verified = Column(Boolean, default=False)
+    email_verified = Column(Boolean, default=False)
+    last_login_at = Column(DateTime, nullable=True)
+    
+    # Preferences
+    communication_preferences = Column(JSON, default=dict)
+    accessibility_needs = Column(JSON, default=list)
+    
+    # Metadata
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    is_active = Column(Boolean, default=True)
+    
+    # Relationships
+    conversations = relationship("Conversation", back_populates="user")
+    
+    __table_args__ = (
+        Index('idx_users_phone', 'phone_number'),
+        Index('idx_users_email', 'email'),
+    )
+
+
+class Agent(Base):
+    """Agent model for healthcare staff."""
+    __tablename__ = "agents"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    employee_id = Column(String(50), unique=True, index=True)
+    name = Column(String(255), nullable=False)
+    email = Column(String(255), unique=True, index=True)
+    
+    # Agent capabilities
+    languages = Column(JSON, default=["en"])
+    specialties = Column(JSON, default=list)  # billing, clinical, pharmacy
+    max_concurrent_chats = Column(Integer, default=5)
+    
+    # Status and availability
+    status = Column(SQLEnum("available", "busy", "away", "offline", name="agent_status"), default="offline")
+    last_activity = Column(DateTime, nullable=True)
+    
+    # Integration IDs
+    mattermost_user_id = Column(String(50), nullable=True)
+    
+    # Performance tracking
+    total_conversations = Column(Integer, default=0)
+    avg_response_time_minutes = Column(Float, default=0.0)
+    satisfaction_score = Column(Float, default=0.0)
+    
+    # Metadata
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    is_active = Column(Boolean, default=True)
+    
+    # Relationships
+    assigned_conversations = relationship("Conversation", back_populates="assigned_agent")
+    escalation_tickets = relationship("EscalationTicket", back_populates="assigned_agent")
+
+
+class Conversation(Base):
+    """Conversation model with full audit trail."""
+    __tablename__ = "conversations"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    assigned_agent_id = Column(UUID(as_uuid=True), ForeignKey("agents.id"), nullable=True)
+    
+    # Conversation details
+    channel = Column(SQLEnum("web", "sms", "voice", "mattermost", name="conversation_channel"))
+    language = Column(String(10), default="en")
+    state = Column(
+        SQLEnum("active", "waiting_for_user", "escalated", "completed", "abandoned", name="conversation_state"),
+        default="active"
+    )
+    
+    # Context and metadata
+    context_data = Column(JSON, default=dict)
+    metadata = Column(JSON, default=dict)
+    
+    # Timing
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    escalated_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    
+    # Quality metrics
+    satisfaction_score = Column(Integer, nullable=True)
+    total_messages = Column(Integer, default=0)
+    ai_resolution = Column(Boolean, default=True)  # False if escalated
+    
+    # Relationships
+    user = relationship("User", back_populates="conversations")
+    assigned_agent = relationship("Agent", back_populates="assigned_conversations")
+    messages = relationship("ConversationMessage", back_populates="conversation")
+    escalation_tickets = relationship("EscalationTicket", back_populates="conversation")
+    
+    __table_args__ = (
+        Index('idx_conversations_user', 'user_id'),
+        Index('idx_conversations_agent', 'assigned_agent_id'),
+        Index('idx_conversations_state', 'state'),
+        Index('idx_conversations_created', 'created_at'),
+    )
+
+
+class ConversationMessage(Base):
+    """Individual messages within conversations."""
+    __tablename__ = "conversation_messages"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    conversation_id = Column(UUID(as_uuid=True), ForeignKey("conversations.id"), nullable=False)
+    
+    # Message details
+    message_type = Column(SQLEnum("user", "assistant", "system", "escalation", name="message_type"))
+    content = Column(Text, nullable=False)
+    encrypted_content = Column(Text, nullable=True)  # Encrypted version if PHI detected
+    
+    # PHI tracking
+    phi_detected = Column(Boolean, default=False)
+    redacted_content = Column(Text, nullable=True)
+    
+    # Attribution
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    agent_id = Column(UUID(as_uuid=True), ForeignKey("agents.id"), nullable=True)
+    
+    # Metadata
+    metadata = Column(JSON, default=dict)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    
+    # Relationships
+    conversation = relationship("Conversation", back_populates="messages")
+    
+    __table_args__ = (
+        Index('idx_messages_conversation', 'conversation_id'),
+        Index('idx_messages_timestamp', 'timestamp'),
+        Index('idx_messages_phi', 'phi_detected'),
+    )
+
+
+class EscalationTicket(Base):
+    """Escalation tickets for human agent assignment."""
+    __tablename__ = "escalation_tickets"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    conversation_id = Column(UUID(as_uuid=True), ForeignKey("conversations.id"), nullable=False)
+    assigned_agent_id = Column(UUID(as_uuid=True), ForeignKey("agents.id"), nullable=True)
+    
+    # Escalation details
+    priority = Column(SQLEnum("low", "normal", "high", "urgent", name="escalation_priority"), default="normal")
+    reason = Column(String(255), nullable=False)
+    category = Column(String(100), nullable=False)
+    description = Column(Text, nullable=True)
+    
+    # Status tracking
+    status = Column(SQLEnum("pending", "assigned", "in_progress", "resolved", "escalated", name="ticket_status"), default="pending")
+    queue_position = Column(Integer, nullable=True)
+    
+    # SLA tracking
+    response_sla_minutes = Column(Integer, default=15)
+    resolution_sla_minutes = Column(Integer, default=60)
+    
+    # Timing
+    created_at = Column(DateTime, default=datetime.utcnow)
+    assigned_at = Column(DateTime, nullable=True)
+    first_response_at = Column(DateTime, nullable=True)
+    resolved_at = Column(DateTime, nullable=True)
+    
+    # Context
+    conversation_summary = Column(JSON, default=dict)
+    user_context = Column(JSON, default=dict)
+    tags = Column(JSON, default=list)
+    notes = Column(JSON, default=list)
+    
+    # Relationships
+    conversation = relationship("Conversation", back_populates="escalation_tickets")
+    assigned_agent = relationship("Agent", back_populates="escalation_tickets")
+    
+    __table_args__ = (
+        Index('idx_tickets_conversation', 'conversation_id'),
+        Index('idx_tickets_agent', 'assigned_agent_id'),
+        Index('idx_tickets_status', 'status'),
+        Index('idx_tickets_priority', 'priority'),
+        Index('idx_tickets_created', 'created_at'),
+    )
+
+
+class AuditLog(Base):
+    """HIPAA-compliant audit logging."""
+    __tablename__ = "audit_logs"
+    
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    
+    # Event details
+    event_type = Column(String(100), nullable=False)
+    event_category = Column(String(50), nullable=False)  # access, modification, security
+    severity = Column(SQLEnum("low", "medium", "high", "critical", name="audit_severity"), default="low")
+    
+    # Context
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    agent_id = Column(UUID(as_uuid=True), ForeignKey("agents.id"), nullable=True)
+    conversation_id = Column(UUID(as_uuid=True), ForeignKey("conversations.id"), nullable=True)
+    
+    # Technical details
+    ip_address = Column(String(45), nullable=True)  # IPv6 compatible
+    user_agent = Column(Text, nullable=True)
+    request_id = Column(String(100), nullable=True)
+    
+    # Event data
+    event_data = Column(JSON, default=dict)
+    affected_resources = Column(JSON, default=list)
+    
+    # Timing
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    
+    # Compliance
+    phi_accessed = Column(Boolean, default=False)
+    retention_until = Column(DateTime, nullable=True)  # For compliance retention
+    
+    __table_args__ = (
+        Index('idx_audit_timestamp', 'timestamp'),
+        Index('idx_audit_event_type', 'event_type'),
+        Index('idx_audit_user', 'user_id'),
+        Index('idx_audit_agent', 'agent_id'),
+        Index('idx_audit_phi', 'phi_accessed'),
+        Index('idx_audit_severity', 'severity'),
+    )
+
+
+class UserProfile(Base):
+    """Extended user profile with healthcare-specific data."""
+    __tablename__ = "user_profiles"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), unique=True, nullable=False)
+    
+    # Healthcare context (anonymized/aggregated)
+    general_conditions = Column(JSON, default=list)  # Aggregated categories
+    care_team_ids = Column(JSON, default=list)
+    insurance_provider = Column(String(100), nullable=True)
+    
+    # Communication preferences
+    preferred_communication_style = Column(String(50), default="professional")
+    needs_interpreter = Column(Boolean, default=False)
+    
+    # Conversation history summary
+    total_conversations = Column(Integer, default=0)
+    avg_satisfaction_score = Column(Float, nullable=True)
+    last_conversation_at = Column(DateTime, nullable=True)
+    
+    # Metadata
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    __table_args__ = (
+        Index('idx_profile_user', 'user_id'),
+    )
+
+
+class SystemConfiguration(Base):
+    """System configuration and feature flags."""
+    __tablename__ = "system_configuration"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    key = Column(String(200), unique=True, nullable=False)
+    value = Column(JSON, nullable=False)
+    value_type = Column(String(50), nullable=False)  # string, int, bool, json
+    
+    # Metadata
+    description = Column(Text, nullable=True)
+    category = Column(String(100), nullable=True)
+    is_encrypted = Column(Boolean, default=False)
+    
+    # Change tracking
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_by = Column(String(255), nullable=True)
+    
+    __table_args__ = (
+        Index('idx_config_key', 'key'),
+        Index('idx_config_category', 'category'),
+    )
+
+
+# Database session management
 async_engine = None
-async_session_maker = None
-sync_engine = None
-Session = None
+AsyncSessionLocal = None
 
 
-class DatabaseManager:
-    """Database manager with HIPAA compliance features."""
+async def init_database():
+    """Initialize database connection and create tables."""
+    global async_engine, AsyncSessionLocal
     
-    def __init__(self):
-        self.settings = get_settings()
-        self._async_engine = None
-        self._async_session_maker = None
-        self._sync_engine = None
-        self._sync_session_maker = None
+    settings = get_settings()
     
-    async def initialize(self) -> None:
-        """Initialize database connections."""
-        await self._create_async_engine()
-        self._create_sync_engine()
-        await self._setup_database()
-        self._setup_event_listeners()
-    
-    async def _create_async_engine(self) -> None:
-        """Create async database engine."""
-        db_config = self.settings.get_database_config()
-        
-        # Convert PostgreSQL URL to async version
-        async_url = db_config["url"].replace("postgresql://", "postgresql+asyncpg://")
-        
-        self._async_engine = create_async_engine(
-            async_url,
-            pool_size=db_config["pool_size"],
+    try:
+        # Create async engine
+        async_engine = create_async_engine(
+            settings.database_url,
+            pool_size=settings.database_pool_size,
             max_overflow=20,
-            pool_timeout=db_config["timeout"],
-            pool_recycle=3600,  # Recycle connections every hour
-            echo=self.settings.debug,  # Log SQL in debug mode
-            future=True
+            pool_timeout=settings.database_timeout,
+            echo=settings.development_mode
         )
         
-        self._async_session_maker = async_sessionmaker(
-            self._async_engine,
+        # Create session factory
+        AsyncSessionLocal = sessionmaker(
+            bind=async_engine,
             class_=AsyncSession,
             expire_on_commit=False
         )
         
-        global async_engine, async_session_maker
-        async_engine = self._async_engine
-        async_session_maker = self._async_session_maker
-    
-    def _create_sync_engine(self) -> None:
-        """Create synchronous database engine for migrations."""
-        db_config = self.settings.get_database_config()
+        # Create all tables
+        async with async_engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
         
-        self._sync_engine = create_engine(
-            db_config["url"],
-            pool_size=db_config["pool_size"],
-            max_overflow=20,
-            pool_timeout=db_config["timeout"],
-            pool_recycle=3600,
-            echo=self.settings.debug,
-            future=True
-        )
+        logger.info("Database initialized successfully")
         
-        self._sync_session_maker = sessionmaker(
-            self._sync_engine,
-            expire_on_commit=False
-        )
-        
-        global sync_engine, Session
-        sync_engine = self._sync_engine
-        Session = self._sync_session_maker
-    
-    async def _setup_database(self) -> None:
-        """Setup database schema and initial data."""
-        try:
-            # Import all models to ensure they're registered
-            from models import *  # noqa
-            
-            # Create all tables
-            async with self._async_engine.begin() as conn:
-                await conn.run_sync(Base.metadata.create_all)
-            
-            log_database_operation(
-                operation="schema_creation",
-                table="all",
-                success=True
-            )
-            
-        except Exception as e:
-            log_database_operation(
-                operation="schema_creation",
-                table="all",
-                success=False,
-                error_message=str(e)
-            )
-            raise
-    
-    def _setup_event_listeners(self) -> None:
-        """Setup SQLAlchemy event listeners for audit logging."""
-        
-        @event.listens_for(self._sync_engine, "before_cursor_execute")
-        def log_sql_queries(conn, cursor, statement, parameters, context, executemany):
-            """Log SQL queries for audit purposes."""
-                         if self.settings.audit_logging_enabled:
-                 # Redact sensitive information from SQL for audit
-                 self._redact_sql_statement(statement)
-                
-                log_database_operation(
-                    operation="sql_query",
-                    table="multiple",
-                    success=True,
-                    execution_time_ms=0
-                )
-    
-    def _redact_sql_statement(self, statement: str) -> str:
-        """Redact PHI from SQL statements."""
-        # Basic redaction - in production, use more sophisticated tools
-        import re
-        
-        # Redact potential PHI patterns
-        redacted = re.sub(
-            r"'[^']*@[^']*'", 
-            "'[REDACTED_EMAIL]'", 
-            statement
-        )
-        redacted = re.sub(
-            r"'\d{3}-?\d{2}-?\d{4}'", 
-            "'[REDACTED_SSN]'", 
-            redacted
-        )
-        
-        return redacted
-    
-    async def health_check(self) -> Dict[str, Any]:
-        """Check database health."""
-        try:
-            async with self._async_session_maker() as session:
-                result = await session.execute("SELECT 1")
-                await result.fetchone()
-            
-            return {
-                "status": "healthy",
-                "connection": "active",
-                "timestamp": datetime.utcnow().isoformat()
-            }
-        except Exception as e:
-            log_security_event(
-                event_type="database_health_check_failed",
-                description=f"Database health check failed: {str(e)}",
-                severity="high"
-            )
-            return {
-                "status": "unhealthy",
-                "error": str(e),
-                "timestamp": datetime.utcnow().isoformat()
-            }
-    
-    async def cleanup(self) -> None:
-        """Cleanup database connections."""
-        if self._async_engine:
-            await self._async_engine.dispose()
-        
-        if self._sync_engine:
-            self._sync_engine.dispose()
+    except Exception as e:
+        logger.error("Failed to initialize database", error=str(e))
+        raise
 
 
-# Global database manager instance
-db_manager = DatabaseManager()
-
-
-async def init_database() -> None:
-    """Initialize database connections and schema."""
-    await db_manager.initialize()
-
-
-async def get_async_session() -> AsyncGenerator[AsyncSession, None]:
-    """Get async database session with proper cleanup."""
-    async with async_session_maker() as session:
+async def get_database() -> AsyncSession:
+    """Get database session."""
+    if not AsyncSessionLocal:
+        await init_database()
+    
+    async with AsyncSessionLocal() as session:
         try:
             yield session
-        except Exception as e:
-            await session.rollback()
-            log_database_operation(
-                operation="session_error",
-                table="session",
-                success=False,
-                error_message=str(e)
-            )
-            raise
         finally:
             await session.close()
 
 
-def get_sync_session():
-    """Get synchronous database session."""
-    session = Session()
-    try:
-        yield session
-    except Exception as e:
-        session.rollback()
-        log_database_operation(
-            operation="session_error",
-            table="session",
-            success=False,
-            error_message=str(e)
-        )
-        raise
-    finally:
-        session.close()
-
-
-async def execute_async_query(query: str, parameters: Optional[Dict] = None) -> Any:
-    """Execute async query with error handling and logging."""
-    start_time = datetime.utcnow()
-    
-    try:
-        async with get_async_session() as session:
-            result = await session.execute(query, parameters or {})
-            await session.commit()
-        
-        execution_time = (datetime.utcnow() - start_time).total_seconds() * 1000
-        
-        log_database_operation(
-            operation="async_query",
-            table="multiple",
-            success=True,
-            execution_time_ms=int(execution_time)
-        )
-        
-        return result
-        
-    except Exception as e:
-        execution_time = (datetime.utcnow() - start_time).total_seconds() * 1000
-        
-        log_database_operation(
-            operation="async_query",
-            table="multiple",
-            success=False,
-            execution_time_ms=int(execution_time),
-            error_message=str(e)
-        )
-        
-        raise
-
-
-class AuditMixin:
-    """Mixin for adding audit fields to models."""
-    
-    created_at = None  # Should be defined in actual models
-    updated_at = None  # Should be defined in actual models
-    created_by = None  # Should be defined in actual models
-    updated_by = None  # Should be defined in actual models
-    
-    def __init__(self):
-        self.created_at = datetime.utcnow()
-        self.updated_at = datetime.utcnow()
-
-
-class EncryptedFieldMixin:
-    """Mixin for handling encrypted fields (PHI data)."""
-    
-    @classmethod
-    def encrypt_field(cls, value: str) -> str:
-        """Encrypt sensitive field value."""
-        if not value:
-            return value
-        
-        # In production, use proper encryption (AWS KMS, etc.)
-        # This is a placeholder implementation
-        import base64
-        return base64.b64encode(value.encode()).decode()
-    
-    @classmethod
-    def decrypt_field(cls, encrypted_value: str) -> str:
-        """Decrypt sensitive field value."""
-        if not encrypted_value:
-            return encrypted_value
-        
-        # In production, use proper decryption
-        # This is a placeholder implementation
-        import base64
-        try:
-            return base64.b64decode(encrypted_value.encode()).decode()
-        except Exception:
-            return encrypted_value  # Return as-is if decryption fails
-
-
 async def check_database_health() -> Dict[str, Any]:
-    """Check database health status."""
-    return await db_manager.health_check()
+    """Check database health for monitoring."""
+    try:
+        async with AsyncSessionLocal() as session:
+            # Test basic connectivity
+            result = await session.execute("SELECT 1")
+            result.scalar()
+            
+            # Get some basic stats
+            users_count = await session.execute("SELECT COUNT(*) FROM users")
+            conversations_count = await session.execute("SELECT COUNT(*) FROM conversations")
+            
+            return {
+                "status": "healthy",
+                "connected": True,
+                "response_time_ms": 0,  # Would measure actual response time
+                "stats": {
+                    "total_users": users_count.scalar(),
+                    "total_conversations": conversations_count.scalar()
+                }
+            }
+            
+    except Exception as e:
+        return {
+            "status": "unhealthy",
+            "connected": False,
+            "error": str(e)
+        }
 
 
-async def cleanup_database() -> None:
-    """Cleanup database connections."""
-    await db_manager.cleanup() 
+async def create_audit_entry(
+    event_type: str,
+    event_category: str,
+    severity: str = "low",
+    user_id: Optional[str] = None,
+    agent_id: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    event_data: Optional[Dict[str, Any]] = None,
+    ip_address: Optional[str] = None,
+    user_agent: Optional[str] = None,
+    request_id: Optional[str] = None,
+    phi_accessed: bool = False
+) -> None:
+    """Create audit log entry for HIPAA compliance."""
+    try:
+        async with AsyncSessionLocal() as session:
+            audit_entry = AuditLog(
+                event_type=event_type,
+                event_category=event_category,
+                severity=severity,
+                user_id=user_id,
+                agent_id=agent_id,
+                conversation_id=conversation_id,
+                event_data=event_data or {},
+                ip_address=ip_address,
+                user_agent=user_agent,
+                request_id=request_id,
+                phi_accessed=phi_accessed,
+                retention_until=datetime.utcnow().replace(year=datetime.utcnow().year + 7)  # 7 year retention
+            )
+            
+            session.add(audit_entry)
+            await session.commit()
+            
+    except Exception as e:
+        logger.error("Failed to create audit entry", error=str(e))
+
+
+async def cleanup_old_data():
+    """Cleanup old data based on retention policies."""
+    try:
+        async with AsyncSessionLocal() as session:
+            current_time = datetime.utcnow()
+            
+            # Delete old audit logs past retention period
+            await session.execute(
+                "DELETE FROM audit_logs WHERE retention_until < :current_time",
+                {"current_time": current_time}
+            )
+            
+            # Archive old conversations (older than 2 years)
+            cutoff_date = current_time.replace(year=current_time.year - 2)
+            await session.execute(
+                "UPDATE conversations SET archived = true WHERE created_at < :cutoff_date AND archived = false",
+                {"cutoff_date": cutoff_date}
+            )
+            
+            await session.commit()
+            logger.info("Database cleanup completed")
+            
+    except Exception as e:
+        logger.error("Database cleanup failed", error=str(e)) 
