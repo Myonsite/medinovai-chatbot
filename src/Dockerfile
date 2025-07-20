@@ -2,7 +2,7 @@
 # HIPAA-compliant, secure Python backend for healthcare AI assistant
 
 # Use official Python runtime as base image
-FROM python:3.11-slim-bullseye
+FROM python:3.14-rc-slim-bookworm
 
 # Metadata
 LABEL maintainer="MedinovAI Team <dev@myonsitehealthcare.com>"
